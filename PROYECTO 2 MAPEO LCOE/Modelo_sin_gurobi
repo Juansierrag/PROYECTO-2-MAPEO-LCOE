@@ -1,0 +1,315 @@
+import numpy as np
+import numpy_financial as npf
+import pulp
+import re
+import csv
+
+def read_inc(path):
+    values = {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                if not line.lstrip().startswith("t"):
+                    continue
+                parts = re.split(r"\s+", line.strip())
+                if len(parts) >= 2:
+                    hour  = int(parts[0][1:])          
+                    value = float(parts[1])
+                    values[hour] = value
+    except FileNotFoundError:
+        return {t: 0.1 for t in range(1, 8761)}
+    return values 
+
+paths = {
+      'Plu'     : 'PluDataCenter.inc',    # DataCenter load factor = 1
+       'lambda'  : 'lambda_spain_localtime.inc', # 8760h 2024 Spanish Spot prices Eur/MWh
+       'psi'     : 'psi.inc', # Tariff of Use of the network Eur/MWh
+       'Ppvu'    : 'PpvuMadridSarah20052023_localtime.inc',  # Perfil Solar Madrid
+       "periodo" : "periodo.inc",  # calendar to assingn type of contracted power
+}
+
+series = {name: read_inc(route) for name, route in paths.items()}
+T = range(1, 8761)
+data = {t: {'lambda': series['lambda'].get(t, 0.0), 'Plu': series['Plu'].get(t, 0.0),
+            'psi': series['psi'].get(t, 0.0), 'Ppvu': series['Ppvu'].get(t, 0.0)} for t in T}
+periodo = {t: int(series["periodo"].get(t, 6)) for t in T}
+
+Plinst  = 1000.0                    # kW peak/installed Load DataCenter
+Rmax   = 1000                       # W/m2
+Area   = 2.4                        # Area module 500W
+eta    = 0.2094                     # PV module efficiency
+eff_c  = 0.9624                     # BESS charge inverter efficiency
+eff_d  = 0.9624                     # BESS discharge inverter efficiency
+DoD    = 0.90                       # Depth of Discharge
+PmaxF   = Plinst                    # límit frontier export/import
+er = 1.1 # exchange rate
+BoP = 0  # Balance of Plant, USD 
+Sc = 1.2 # Soft costs, %
+OaMpv = 12.5  #USD/kWp
+OaMbess = 5.9    #USD/kWp
+CAPEX_pv = 388 #USD/kWp
+CAPEX_BESS = 185 #USD/kWh
+CAPEX_inverter = 48 #USD/kWp
+i=7.7/100 #annual discount rate (Lazard)
+n=20 #project life span
+e=2.5/100 # escalation rate
+ir=(i-e)/(1+e) #equivalent annual discount rate
+crf=(i*(i+1)**n)/((i+1)**n-1) #capital recovery factor
+crfe=(1+e)*(ir*(ir+1)**n)/((ir+1)**n-1) #capital recovery factor modified
+
+kappa = [0, 28.79187*er, 15.07764*er, 6.55917*er, 5.17209*er, 1.93281*er, 0.91609*er] 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# The model (Re-written for PuLP with Big-M Linearization)
+# ─────────────────────────────────────────────────────────────────────────────
+m = pulp.LpProblem('SizingModel', pulp.LpMaximize)
+
+# Variables
+Savings = pulp.LpVariable('Savings', lowBound=None) 
+OPEX = pulp.LpVariable('OPEX', lowBound=0)
+CapacityP = pulp.LpVariable('Capacity', lowBound=0)
+CapacityP0 = pulp.LpVariable('Capacity0', lowBound=0)
+npv_var = pulp.LpVariable('npv', lowBound=None)
+Benefit = pulp.LpVariable('Benefit', lowBound=None)
+OPEX0 = pulp.LpVariable('OPEX0', lowBound=None)
+Eb = pulp.LpVariable('Eb', lowBound=0)
+Eb0 = pulp.LpVariable('Eb0', lowBound=0)
+Es = pulp.LpVariable('Es', lowBound=0)
+wpvmx = pulp.LpVariable('wpvmx', lowBound=None)
+wpv = pulp.LpVariable('wpv', lowBound=None)
+wclipping = pulp.LpVariable('wclipping', lowBound=None)
+Wb = pulp.LpVariable('Wb', lowBound=None)
+Ws = pulp.LpVariable('Ws', lowBound=None)
+Wl = pulp.LpVariable('Wl', lowBound=None)
+Wd = pulp.LpVariable('Wd', lowBound=None)
+Wc = pulp.LpVariable('Wc', lowBound=None)
+CashFlow_var = pulp.LpVariable('CashFlow', lowBound=None)
+Investment0 = pulp.LpVariable('Investment', lowBound=0)
+PinverterBESS = pulp.LpVariable('PinverterBESS', lowBound=0)
+PinverterPV = pulp.LpVariable('PinverterPV', lowBound=0)
+Ppvinst = pulp.LpVariable('Ppvinst', lowBound=0)
+SOC0 = pulp.LpVariable('SOC0', lowBound=0)
+nx = pulp.LpVariable('nx', lowBound=0)
+C = pulp.LpVariable('C', lowBound=0)
+
+Pbmax = pulp.LpVariable.dicts('PbmaxP', range(1, 7), lowBound=0)
+SOC = pulp.LpVariable.dicts('SOC', T, lowBound=0)
+Ppv = pulp.LpVariable.dicts('Ppv', T, lowBound=0)
+Ppvmx = pulp.LpVariable.dicts('Ppvmx', T, lowBound=0)
+Pd = pulp.LpVariable.dicts('Pd', T, lowBound=0)
+Pc = pulp.LpVariable.dicts('Pc', T, lowBound=0)
+Pb = pulp.LpVariable.dicts('Pb', T, lowBound=0)
+Ps = pulp.LpVariable.dicts('Ps', T, lowBound=0)
+w1 = pulp.LpVariable.dicts('w1', T, cat=pulp.LpBinary)
+w3 = pulp.LpVariable.dicts('w3', T, cat=pulp.LpBinary)
+
+# Constraints
+for t in T:
+    m += Pbmax[periodo[t]] >= Pb[t]
+m += Pbmax[6] == PmaxF
+for p in range(1, 6): 
+    m += Pbmax[p+1] >= Pbmax[p]
+
+# Constante Big-M para la linearización (100 MW es suficientemente grande para los límites del proyecto)
+M_inv = 100000  
+
+for t in T:
+    m += Pd[t] + Pb[t] + Ppv[t] == Pc[t] + Ps[t] + Plinst * data[t]['Plu']
+    m += Ppvmx[t] == Ppvinst * data[t]['Ppvu']
+    
+    if t == 1:
+        m += SOC[t] == SOC0 + Pc[t]*eff_c - Pd[t]/eff_d
+    else:
+        m += SOC[t] == SOC[t-1] + Pc[t]*eff_c - Pd[t]/eff_d
+        
+    m += Ppv[t] <= Ppvmx[t]
+    
+    # --- Restricciones linearizadas con Big-M ---
+    m += Pc[t] <= M_inv * w1[t]
+    m += Pc[t] <= PinverterBESS
+    
+    m += Pd[t] <= M_inv * (1 - w1[t])
+    m += Pd[t] <= PinverterBESS
+    # --------------------------------------------
+    
+    m += Pb[t] <= PmaxF * w3[t]
+    m += Ps[t] <= PmaxF * (1-w3[t])
+    
+    m += SOC[t] <= ((1-DoD)/2 + DoD)*C
+    m += SOC[t] >= ((1-DoD)/2)*C
+
+m += SOC0 <= ((1-DoD)/2 + DoD)*C
+m += SOC0 >= ((1-DoD)/2)*C
+
+# FINANCIAL EQUATIONS
+m += Es == er * pulp.lpSum(data[t]['lambda'] * Ps[t] for t in T)
+m += Eb == er * pulp.lpSum((data[t]['lambda'] + data[t]['psi']) * Pb[t] for t in T)
+m += Eb0 == er * pulp.lpSum((data[t]['lambda'] + data[t]['psi']) * Plinst * data[t]['Plu'] for t in T)
+m += CapacityP == pulp.lpSum(kappa[p]*Pbmax[p] for p in range(1, 7))
+m += CapacityP0 == sum(kappa[p]*PmaxF for p in range(1, 7))
+m += OPEX0 == Eb0 + CapacityP0
+m += OPEX == CapacityP + Eb + OaMpv*Ppvinst + OaMbess*C
+m += Savings == OPEX0 - OPEX
+m += Benefit == Es - OPEX
+m += CashFlow_var == Es + OPEX0 - OPEX
+m += Investment0 == BoP + Sc * (CAPEX_pv*Ppvinst + CAPEX_BESS*C + CAPEX_inverter*(PinverterBESS+PinverterPV))
+m += npv_var == 1*CashFlow_var/(crfe) - 1*Investment0
+
+# ENERGY DISPATCH
+m += wpv == pulp.lpSum(Ppv[t] for t in T)
+m += wpvmx == pulp.lpSum(Ppvmx[t] for t in T)
+m += Wb == pulp.lpSum(Pb[t] for t in T)
+m += Ws == pulp.lpSum(Ps[t] for t in T)
+m += Wc == pulp.lpSum(Pc[t] for t in T)
+m += Wd == pulp.lpSum(Pd[t] for t in T)
+m += Wl == sum(Plinst * data[t]['Plu'] for t in T)
+m += wclipping == wpvmx - wpv
+m += PinverterBESS <= C*2.0
+m += PinverterBESS >= C*0.1
+m += nx == 1000*Ppvinst/(Rmax*eta*Area)
+
+m += PinverterPV == Plinst+PmaxF+PinverterBESS   
+
+# Objective
+m += npv_var
+
+# Solve the model (msg=True to see progress in terminal)
+print("Resolviendo el modelo. Esto puede tomar unos minutos dependiendo de tu procesador...")
+m.solve(pulp.PULP_CBC_CMD(msg=True))
+
+status = pulp.LpStatus[m.status]
+
+if status == 'Optimal':
+    # Safeguards against division by zero
+    val_C = C.varValue if C.varValue else 0
+    val_PinverterPV = PinverterPV.varValue if PinverterPV.varValue else 0
+    val_Wl = Wl.varValue if Wl.varValue else 0
+    
+    Crate = (PinverterBESS.varValue / val_C) if val_C > 0 else 0
+    BESSinverterCost = CAPEX_inverter * PinverterBESS.varValue
+    PVinverterCost = CAPEX_inverter * val_PinverterPV
+    BESSbatteryCost = CAPEX_BESS * val_C
+    PVsystemCost = CAPEX_pv * Ppvinst.varValue + CAPEX_inverter * val_PinverterPV
+    ILR = (Ppvinst.varValue / val_PinverterPV) if val_PinverterPV > 0 else 0
+
+    Io = Investment0.varValue
+    CF = CashFlow_var.varValue
+    TIR = npf.irr([-Io] + [CF]*n) * 100 if Io > 0 else 0
+    BCratio = npf.pv(rate=i, nper=n, pmt=-CF, fv=0) / Io if Io > 0 else 0
+    OPEXgross = OaMpv * Ppvinst.varValue + OaMbess * val_C
+    LCOEgross = 1000*(Io + OPEXgross/crfe)/(val_Wl/crf) if val_Wl > 0 else 0
+    LCOEnet = 1000*(Io + (OPEX.varValue - OPEX0.varValue - Es.varValue)/crfe)/(val_Wl/crf) if val_Wl > 0 else 0
+    NPERaprox = Io/CF if CF > 0 else 0
+    try:
+        NPER = np.log((CF - i * 0) / (CF + i * (-Io))) / np.log(1 + i) if (CF + i * (-Io)) > 0 else 0
+    except: 
+        NPER = 0
+  
+# ─────────────────────────────────────────────────────────────────────────────
+if status == 'Optimal':
+    print(f"Results:")
+    print(f"------ System sizing  ------------------")
+    print(f"BESS capacity (WbessInst): {C.varValue:,.2f} kWh")
+    print(f"BESS inverter capacity (PbessInst): {PinverterBESS.varValue:,.2f} kW")
+    
+    if Crate > 0:
+        print(f"BESS C-rate:  {Crate:,.2f} 1/h,  {1/Crate:,.2f}  hours")
+    else:
+        print(f"BESS C-rate:  0.00 1/h")
+        
+    print(f"PV System capacity (PpvInst): {Ppvinst.varValue:,.2f} kWdc")
+    print(f"PV System inverter (Ppv_inverter): {PinverterPV.varValue:,.2f} kWpv")
+    print(f"PV inverter load ratio (ILR, MWdc/MWp): {ILR:,.2f} ")
+    print(f"Npan: {nx.varValue:,.2f} modules of 500W")
+    print(f"Contracted power per period")
+    print(f"PbmaxP1: {Pbmax[1].varValue:,.2f} kW")
+    print(f"PbmaxP2: {Pbmax[2].varValue:,.2f} kW") 
+    print(f"PbmaxP3: {Pbmax[3].varValue:,.2f} kW") 
+    print(f"PbmaxP4: {Pbmax[4].varValue:,.2f} kW") 
+    print(f"PbmaxP5: {Pbmax[5].varValue:,.2f} kW") 
+    print(f"PbmaxP6: {Pbmax[6].varValue:,.2f} kW")       
+    print(f"------Energy Dispatch--------------------")
+    print(f"Energy load consumption (Wl): {Wl.varValue:,.2f} kWh/year")
+    print(f"Energy bought from the market (Wb): {Wb.varValue:,.2f} kWh/year")
+    print(f"Energy sold to the market (Ws): {Ws.varValue:,.2f} kWh/year")
+    print(f"BESS Energy charged (Wc): {Wc.varValue:,.2f} kWh/year")
+    print(f"BESS Energy discharged (Wd): {Wd.varValue:,.2f} kWh/year")
+    print(f"PV energy generated (wpvmx): {wpvmx.varValue:,.2f} kWh/year")
+    print(f"PV energy injected (wpv): {wpv.varValue:,.2f} kWh/year")
+    print(f"PV energy curtailed (Clipping) (Wclipping): {wclipping.varValue:,.2f} kWh/year")
+    print(f"Initial SOC:  {SOC0.varValue:,.2f} MWh")
+    print(f"------Financial results--------------------")   
+    print(f"Operational Benefit: {Benefit.varValue:,.2f} USD/year")
+    print(f"Operational Expenditure with the project (OPEX): {OPEX.varValue:,.2f} USD/year")
+    print(f"Operational Expenditure without the project (OPEX_0): {OPEX0.varValue:,.2f} USD/year")
+    print(f"Operational Savings (Savings): {Savings.varValue:,.2f} USD/year")
+    print(f"Energy expenses with the project (Eb): {Eb.varValue:,.2f} USD/year")
+    print(f"Energy expenses without the project (Eb0): {Eb0.varValue:,.2f} USD/year")
+    print(f"Energy earnings of the project (Es): {Es.varValue:,.2f} USD/year")
+    print(f"Capacity Charges (CP): {CapacityP.varValue:,.2f} USD/year")
+    print(f"Capacity Charges without the project (CP0): {CapacityP0.varValue:,.2f} USD/year")
+    print(f"Capital Expenditure (CAPEX): {Investment0.varValue:,.2f} USD")
+    print(f"BESS battery cost: {BESSbatteryCost:,.2f} USD")
+    print(f"BESS inverter cost: {BESSinverterCost:,.2f} USD")
+    print(f"PV inverter cost: {PVinverterCost:,.2f} USD")
+    print(f"Soft Costs: {Investment0.varValue*(Sc-1):,.2f} USD")
+    print(f"PV system cost: {PVsystemCost:,.2f} USD")
+    print(f"Net Present Value: {npv_var.varValue:,.2f} USD  (Objective)")
+    print(f"Project Cash Flow: {CF:,.2f} USD/year")
+    print(f"Internal Rate of Return:      {TIR:,.2f} %")
+    print(f"Pay Back Time:     {NPER:,.2f} years")
+    print(f"Simple Pay Back Time:    {NPERaprox:,.2f} years")
+    print(f"Net LCOE (include earnings and savings):     {LCOEnet:,.2f} USD/MWh")
+    print(f"Gross LCOE: (only CAPEX and OPEX)    {LCOEgross:,.2f} USD/MWh")
+    print(f"Benefit-Cost Ratio {BCratio:,.2f}")  
+else:
+    print("No optimal solution, state code:", status)
+    
+if status == 'Optimal':
+    with open('solution_sizing_model.csv', 'w', newline='') as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(["Hour", "Pb", "Ppv", "Pd", "Ppvmax", "Ps", "Pc", "SOC", "SpotPrice", "npv"])
+        for t in T:
+            writer.writerow([
+                t,
+                Pb[t].varValue,
+                Ppv[t].varValue,
+                Pd[t].varValue,
+                Ppvmx[t].varValue,
+                Ps[t].varValue,
+                Pc[t].varValue,
+                SOC[t].varValue,
+                data[t]['lambda'],
+                npv_var.varValue
+            ])
+    print("Solution written to solution_sizing_model.csv") 
+    
+    with open('solution_daily_summary.csv', 'w', newline='') as csvfile_daily:
+        writer_daily = csv.writer(csvfile_daily)
+        writer_daily.writerow(["Day", "Pb_Sum", "Ppv_Sum", "Pd_Sum", "Ppvmax_Sum", "Ps_Sum", "Pc_Sum", "SOC_Avg", "Benefit", "npv"])
+        
+        for d in range(365):
+            day_hours = range(d * 24 + 1, (d + 1) * 24 + 1)
+            
+            pb_sum = sum(Pb[t].varValue for t in day_hours)
+            ppv_sum = sum(Ppv[t].varValue for t in day_hours)
+            pd_sum = sum(Pd[t].varValue for t in day_hours)
+            ppvmax_sum = sum(Ppvmx[t].varValue for t in day_hours)
+            ps_sum = sum(Ps[t].varValue for t in day_hours)
+            pc_sum = sum(Pc[t].varValue for t in day_hours)
+            
+            soc_avg = sum(SOC[t].varValue for t in day_hours) / 24
+            
+            writer_daily.writerow([
+                d + 1,
+                pb_sum,
+                ppv_sum,
+                pd_sum,
+                ppvmax_sum,
+                ps_sum,
+                pc_sum,
+                soc_avg,
+                Benefit.varValue,
+                npv_var.varValue 
+            ])
+    print("Daily summary written to solution_daily_summary.csv")

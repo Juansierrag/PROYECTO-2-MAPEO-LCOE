@@ -1,0 +1,88 @@
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+import pandas as pd
+import datetime
+
+# 1. Configurar conexión robusta con reintentos automáticos
+session = requests.Session()
+# Reintentará 5 veces, esperando cada vez más tiempo entre intentos si hay un error
+retry_strategy = Retry(
+    total=5,
+    backoff_factor=2, 
+    status_forcelist=[429, 500, 502, 503, 504],
+)
+adapter = HTTPAdapter(max_retries=retry_strategy)
+# Cambio a HTTPS
+session.mount("https://", adapter)
+session.mount("http://", adapter)
+
+# 2. Definir fechas
+start_date = datetime.date(2024, 1, 1)
+end_date = datetime.date(2024, 12, 31)
+
+# Asegurar conexión segura HTTPS
+url = "https://servapibi.xm.com.co/hourly"
+all_data = []
+current_date = start_date
+
+print("Conectando de forma segura a la API de XM (con reintentos)...")
+
+# 3. Descargar datos mes a mes
+while current_date <= end_date:
+    next_date = current_date + datetime.timedelta(days=29)
+    if next_date > end_date:
+        next_date = end_date
+        
+    payload = {
+        "MetricId": "PrecBolsNaci",
+        "Entity": "Sistema",
+        "StartDatetime": current_date.strftime("%Y-%m-%d"),
+        "EndDatetime": next_date.strftime("%Y-%m-%d")
+    }
+    
+    try:
+        # Se agrega un timeout de 30 segundos
+        response = session.post(url, json=payload, timeout=30)
+        
+        if response.status_code == 200:
+            data = response.json().get('Items', [])
+            all_data.extend(data)
+            print(f"-> Descargado: {current_date} al {next_date}")
+        else:
+            print(f"Error {response.status_code} descargando de {current_date} a {next_date}")
+            
+    except requests.exceptions.RequestException as e:
+        print(f"Fallo crítico de conexión para las fechas {current_date} a {next_date}. Detalle: {e}")
+        
+    current_date = next_date + datetime.timedelta(days=1)
+
+# Si logró descargar datos, los procesa
+if all_data:
+    # 4. Transformar los datos a formato plano
+    df_precio = pd.DataFrame(all_data)
+    columnas_horas = [f'Hour{str(i).zfill(2)}' for i in range(1, 25)]
+
+    df_plano = df_precio.melt(
+        id_vars=['Date'], 
+        value_vars=columnas_horas, 
+        var_name='Hora', 
+        value_name='Precio_COP_kWh'
+    )
+
+    # 5. Ordenar cronológicamente
+    df_plano['Hora_Num'] = df_plano['Hora'].str.replace('Hour', '').astype(int)
+    df_plano['Date_Clean'] = pd.to_datetime(df_plano['Date'].str[:10]) 
+    df_plano['FechaHora'] = df_plano['Date_Clean'] + pd.to_timedelta(df_plano['Hora_Num'] - 1, unit='h')
+    df_plano = df_plano.sort_values('FechaHora').reset_index(drop=True)
+
+    # 6. Exportar al formato .inc requerido por el modelo
+    nombre_archivo = 'lambda_colombia.inc'
+
+    with open(nombre_archivo, 'w', encoding='utf-8') as f:
+        for i, precio in enumerate(df_plano['Precio_COP_kWh'], start=1):
+            f.write(f"t{i} {precio}\n")
+
+    print(f"\n¡Extracción exitosa! Se han guardado {len(df_plano)} horas en {nombre_archivo}")
+else:
+    print("\nNo se pudo descargar ningún dato. Verifica tu conexión a internet o el estado de los servidores de XM.")
