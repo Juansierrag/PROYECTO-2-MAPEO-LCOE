@@ -35,8 +35,8 @@ paths = {
 #    Colombia Electricity Market    
        'lambda'  : 'lambda_colombia.inc', # 8760h 2025-08-31 to 2026-08-30 Colombia Spot prices Cop/KWh
        'psi'     : 'psi_colombia.inc', # Tariff of Use of the network cop/kWh
-       'Ppvu'    : 'PpvuMadridSarah20052023_localtime.inc',  # Perfil Solar Madrid España Sarah 2005-2023
-       "periodo" : "periodo.inc",  # calendar to assingn type of contracted power 1..6 per each hour
+       'Ppvu'    : 'solar_colombia.inc',  # Perfil Solar Madrid España Sarah 2005-2023
+       "periodo" : "periodo_colombia.inc",  # calendar to assingn type of contracted power 1..6 per each hour
 # ----------------------
 }
 series = {name: read_inc(route) for name, route in paths.items()}

@@ -1,0 +1,11 @@
+nombre_archivo = 'periodo_colombia.inc'
+horas_ano = 8760
+
+print(f"Generando el archivo {nombre_archivo} con un único periodo tarifario...")
+
+with open(nombre_archivo, 'w', encoding='utf-8') as f:
+    for i in range(1, horas_ano + 1):
+        # Asigna el Periodo 1 a absolutamente todas las horas
+        f.write(f"t{i} 1\n")
+
+print("¡Listo! Archivo de periodos creado exitosamente.")
